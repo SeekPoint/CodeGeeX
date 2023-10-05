@@ -205,30 +205,55 @@ def setup_deepspeed_random_and_activation_checkpointing(args):
         deepspeed.checkpointing.model_parallel_cuda_manual_seed
     )
 
+'''
+总体来说，这个代码实现了3个目的：
 
+    设置分布式环境：初始化进程，分配GPU，并设置进程大组（group）。也即例子中的0~15号进程同属一个分布式进程大组
+    
+    制定DP/TP/PP分组策略，设置进程子组（subgroup）
+    
+    设置DeepSpeed ZeRO-R，对activation进行优化
+
+我们来逐一讲解。
+'''
 def _initialize_distributed():
-    """Initialize torch.distributed and mpu."""
+    """Initialize torch.distributed and mpu.
+                |    Node1  |   Node2    |
+    ____________| p1 |  p2  |  p3  |  p4 |
+    local_rank  | 0  |   1  |  0   |   1 |
+    rank        | 0  |   1  |  2   |   3 |
+
+    node: 物理结点，1台机器或者1个容器。图中2个物理结点
+    rank：进程在全局上的序号。图中4个进程
+    local_rank：进程在node上的序号。
+    torch.cuda.device_count()：当前进程所在的node上可使用的GPU的数量
+    device：GPU在某个node上的编号
+
+    该函数作用：
+    1、设置分布式环境：初始化进程，分配GPU，并设置进程大组（group）
+    2、制定DP/TP/PP分组策略，设置进程子组（subgroup）
+    3、设置DeepSpeed ZeRO-R，对activation进行优化
+    """
     args = get_args()
 
-    device_count = torch.cuda.device_count()
-    if torch.distributed.is_initialized():
-
-        if args.rank == 0:
+    device_count = torch.cuda.device_count() # 当前进程所在的node上可使用的GPU的数量
+    if torch.distributed.is_initialized(): # 如果已创建好分布式环境
+        if args.rank == 0: # 在0号进程上打印出“创建完毕”的日志
             print(
                 "torch distributed is already initialized, "
                 "skipping initialization ...",
                 flush=True,
             )
-        args.rank = torch.distributed.get_rank()
-        args.world_size = torch.distributed.get_world_size()
+        args.rank = torch.distributed.get_rank() # 取得当前进程的全局序号
+        args.world_size = torch.distributed.get_world_size() # 取得全局进程的个数
 
-    else:
-
+    else: # 如果未创建好分布式环境
         if args.rank == 0:
             print("> initializing torch distributed ...", flush=True)
         # Manually set the device ids.
+        # 1. 初始化进程，分配GPU，并设置进程大组（group）
         if device_count > 0:
-            device = args.rank % device_count
+            device = args.rank % device_count # 1块进程1个GPU。device为GPU编号。例如图例中的进程9，其所在机器上有8块卡。因此进程9使用的gpu编号为8%9=1
             if args.local_rank is not None:
                 assert (
                     args.local_rank == device
@@ -240,11 +265,12 @@ def _initialize_distributed():
                     f"  > forcefully set the device to {args.force_device}, originally {device}"
                 )
                 device = args.force_device
-            torch.cuda.set_device(device)
+            torch.cuda.set_device(device)  # 为当前进程分配GPU
         # Call the init process
+        # 设置进程大组
         init_method = "tcp://"
-        master_ip = os.getenv("MASTER_ADDR", "localhost")
-        master_port = os.getenv("MASTER_PORT", "6000")
+        master_ip = os.getenv("MASTER_ADDR", "localhost") # 获取rank=0进程的ip
+        master_port = os.getenv("MASTER_PORT", "6000") # 获取rank=0进程的端口
         init_method += master_ip + ":" + master_port
         print(
             f"  > (rank={args.rank}) initializing process group: "
@@ -265,19 +291,20 @@ def _initialize_distributed():
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
+	# 2、制定DP/TP/PP分组策略，设置进程子组（subgroup）
     if device_count > 0:
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
-            mpu.initialize_model_parallel(
+            mpu.initialize_model_parallel( # megatron/mpu/initialize.py
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
             )
 
+    # 设置DeepSpeed ZeRO-R，对activation进行优化
     if args.deepspeed and args.deepspeed_activation_checkpointing:
         setup_deepspeed_random_and_activation_checkpointing(args)
-
 
 def _init_autoresume():
     """Set autoresume start time."""

@@ -1,0 +1,10 @@
+图解大模型训练之：Megatron源码解读2，模型并行
+https://zhuanlan.zhihu.com/p/634377071
+
+猛猿：图解大模型训练之：流水线并行（Pipeline Parallelism），以Gpipe为例
+
+猛猿：图解大模型训练之：数据并行上篇(DP, DDP与ZeRO)
+
+猛猿：图解大模型训练之：数据并行下篇(ZeRO，零冗余优化)
+
+猛猿：图解大模型系列之：张量模型并行，Megatron-LM

@@ -73,7 +73,9 @@ def print_datetime(string):
     time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print_rank_0("[" + string + "] datetime: {} ".format(time_str))
 
-
+# 3.2 代码整体解读
+# 明确了初始化代码要做的事情，现在可以来看代码实现了。
+# 回到pretrain函数，它的第一行就通过initialize_megatron执行了分布式初始化：
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
