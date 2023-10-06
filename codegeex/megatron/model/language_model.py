@@ -112,36 +112,39 @@ class Embedding(MegatronModule):
     """
 
     def __init__(
-        self,
-        hidden_size,
-        vocab_size,
-        max_sequence_length,
-        embedding_dropout_prob,
-        init_method,
-        num_tokentypes=0,
+            self,
+            hidden_size,  # 每个token的向量维度
+            vocab_size,  # 词表大小
+            max_sequence_length,  # 最长序列长度
+            embedding_dropout_prob,  # dropout probability for embeddings
+            init_method,  # 初始化权重的方法
+            num_tokentypes=0,  # 类似于Bert中的segment type
     ):
         super(Embedding, self).__init__()
-        
+
         args = get_args()
-        
+
         self.hidden_size = hidden_size
         self.init_method = init_method
         self.num_tokentypes = num_tokentypes
         self.max_sequence_length = max_sequence_length
-        
+
         # Word embeddings (parallel).
+        # WE size: (vocab_size//TP_N, hidden_size)
+        # TP_N表示TP组模型并行度
         self.word_embeddings = mpu.VocabParallelEmbedding(
             vocab_size, self.hidden_size, init_method=self.init_method)
         self._word_embeddings_key = 'word_embeddings'
-            
+
         self.vocab_size = vocab_size
 
         # Position embedding (serial).
+        # PE size: (max_seq_len, hidden_size)
         self.position_embeddings = torch.nn.Embedding(
             max_sequence_length, self.hidden_size)
         self.position_embeddings = self.position_embeddings.half()
         self._position_embeddings_key = 'position_embeddings'
-            
+
         # Initialize the position embeddings.
         self.init_method(self.position_embeddings.weight)
 
@@ -149,6 +152,8 @@ class Embedding(MegatronModule):
         # Add this as an optional field that can be added through
         # method call so we can load a pretrain model without
         # token types and add them as needed.
+        # TE_size:(num_tokentypes, hidden_size)
+        # TE类似于Bert中的segment embedding
         self._tokentype_embeddings_key = 'tokentype_embeddings'
         if self.num_tokentypes > 0:
             self.tokentype_embeddings = torch.nn.Embedding(self.num_tokentypes,
@@ -165,6 +170,8 @@ class Embedding(MegatronModule):
         """Add token-type embedding. This function is provided so we can add
         token-type embeddings in case the pretrained model does not have it.
         This allows us to load the model normally and then add this embedding.
+
+		如果在pretrain阶段未定义TE，而在fine-tune阶段TE，则可通过此函数添加
         """
         if self.tokentype_embeddings is not None:
             raise Exception('tokentype embeddings is already initialized')
@@ -178,10 +185,19 @@ class Embedding(MegatronModule):
         self.init_method(self.tokentype_embeddings.weight)
 
     def forward(self, input_ids, position_ids, tokentype_ids=None):
+        """
+        定义输入X过embedding层的计算方法
+        """
         # Embeddings.
+        # words_embeddings size = (b, seq_len, hidden_size)
+        # 再次注意：self.word_embeddings做forward时，最终的输出结果时AllReduce的（见上图）
         words_embeddings = self.word_embeddings(input_ids)
+        # position_embeddings size = （b, seq_len, hidden_size）
         position_embeddings = self.position_embeddings(position_ids)
+        # embedding = WE + PE
+        # embedding size = (b, seq_len, hidden_size)
         embeddings = words_embeddings + position_embeddings
+        # 依需要决定是否增加TE
         if tokentype_ids is not None:
             assert self.tokentype_embeddings is not None
             embeddings = embeddings + self.tokentype_embeddings(tokentype_ids)
@@ -194,9 +210,14 @@ class Embedding(MegatronModule):
         return embeddings
 
     def state_dict_for_save_checkpoint(
-        self, destination=None, prefix='', keep_vars=False,
+            self, destination=None, prefix='', keep_vars=False,
     ):
-        """For easy load."""
+        """
+		For easy load.
+
+		在模型训练过程中及时读取当前参数，方便及时保存（做checkpoint）
+        篇幅限制，这里不展示细节
+		"""
 
         state_dict_ = {}
         state_dict_[self._word_embeddings_key] \
@@ -212,7 +233,12 @@ class Embedding(MegatronModule):
         return state_dict_
 
     def load_state_dict(self, state_dict, strict=True):
-        """Customized load."""
+        """
+		Customized load.
+
+		用于模型的重载。例如训到一半挂掉了，我们就重新初始化一个新模型，
+        重载上个checkpoint保存下的权重。
+		"""
 
         # Word embedding.
         if self._word_embeddings_key in state_dict:
@@ -238,13 +264,13 @@ class Embedding(MegatronModule):
                 if 'position_embeddings' in key:
                     state_dict_[key.split('position_embeddings.')[1]] \
                         = state_dict[key]
-        
+
         pos_len = state_dict_['weight'].shape[0]
         max_seq_len = self.max_sequence_length
         if pos_len < max_seq_len:
             print_rank_0(f"Position embedding padded {pos_len} -> {max_seq_len}.")
             position_embeddings_padded = torch.nn.Embedding(
-            max_seq_len - pos_len, self.hidden_size).half()
+                max_seq_len - pos_len, self.hidden_size).half()
             self.init_method(position_embeddings_padded.weight)
             state_dict_['weight'] = torch.cat([state_dict_['weight'], position_embeddings_padded.weight], dim=0)
 

@@ -1,0 +1,737 @@
+图解大模型训练之：Megatron源码解读2，模型并行
+
+https://zhuanlan.zhihu.com/p/634377071
+
+
+源码解读系列将和大家一起来读Megatron的pretrain部分代码。
+在源码解读第一篇中，我们讲解了如何做分布式环境初始化，即按照DP/TP/PP对进程进行分组，并为每个进程指定GPU。
+在这一章中，我们将一起读模型并行部分：如何切分模型，并搬入分布式环境定义好的DP/TP/PP组中。
+08.webp
+
+【本文将提供】
+
+详细的图解。画图说明代码的设计架构，讲清代码想做一件什么事。
+详细的代码注释。在图解的基础上，提取核心代码部分，并附上注释。
+【如何利用本文提高源码阅读效率】
+
+先看一~三部分。了解模型并行的设计思想、整体框架及入口函数。
+打开Megatron源码，找到入口函数，开始阅读。
+阅读中的每一块细节，可参考四～八部分。
+【阅读本文前置知识】
+
+猛猿：图解大模型训练之：张量模型并行(TP)，Megatron-LM
+
+猛猿：图解大模型系列之：Megatron源码解读1，分布式环境初始化
+
+【写作和绘图不易，如果觉得本文有帮助，麻烦点一个赞，可以让更多人看到，谢谢大家～】
+
+一、模型概述
+...yknote和第一篇重复
+由图可知，CodeGeeX在预训练中采用的是8头TP（同一个node内的8张卡做TP，8张卡组成一个完整的模型），
+192头DP（192个node间做DP），一共1536块GPU进行训练。
+
+【阅读提醒】：如果你对GPT模型比较熟悉，则不需要花时间细看CodeGeeX架构图也能无障碍阅读本文。
+架构图只是在涉及模型细节时，可以对照着看。
+
+二、模型切割在做一件什么事
+2.1 模型切割设计思想
+回顾一下，在初始化分布式环境中，我们根据DP/TP/PP组设置并划分了进程，确定了模型的切割方法，如下图：
+    06.webp
+（注意：这并不是CodeGeeX的划分框架，而是一个更广义的例子，细节可阅读上篇讲解）
+
+接下来，我们就可以根据这个框架来切割模型了。
+pytorch默认将模型（nn.Module）定义在CPU上，因此，我们在CPU上定义并初始化模型，然后将其搬运到当前进程所对应的GPU上，
+整个过程如下图： 09.webp
+
+首先，我们是面向进程编程的，也就是整份脚本处理的是发生在1个进程上的事情。
+这样做的好处是，我们只需要维护1份脚本，然后将其发去不同机器的各张卡上执行，就能实现全局的并行。
+
+但是，1个进程处理的是模型的不同部分，
+比如GPT模型，它的pre层涉及到Embedding计算，post层涉及到softmax和loss的计算，这样每个进程上处理的模型是不一样的，这时怎么办呢？
+别忘了，我们能够取到进程id（全局或DP/TP/PP组内的），这样我们就能通过进程id，写if..else.. 来解决模型差异化问题了。
+明确了这个思想，现在我们可以开始写代码了，我们有两种方式对模型进行切割：
+
+    方案一：先定义出完整的模型，并对模型参数做初始化，然后根据进程id取出相应子模型，搬运到GPU上
+
+    方案二：直接根据进程id，设计好当前子模型，做参数初始化，搬运到GPU上
+
+这两者的核心差别，在于“随机种子”的设定。
+
+2.2 随机种子
+在分布式训练中，随机种子是非常重要的，它关系到模型是否能够复现。
+例如我们采取activation checkpoint的技术来节省显存时，在backward过程中我们需要重算forward得到activation，
+这时候就需要我们完整复现之前forward的过程，各类参数的初始化结果也要和之前完全一致。
+我们来看几个例子：
+例1: Word Embedding    10.webp
+WE1和WE2间需要采用不同的随机种子。因为若采用相同的随机种子，则WE1和WE2的结果完全一样，这不等价于先随机初始化WE，再将它进行切割。
+
+例2: dropout  11.webp
+左侧方框中的2个dropout，在初始化时需要用不同的随机种子。因为这样才等价于对完整的dropout做初始化，然后再切割。
+右侧方框中的dropout，需要用相同的随机种子
+（虽然右边只画了1个dropout，但其实是2个dropout，每块GPU上各一个，因为此时两块GPU上的输出已经AllReduce，
+是完全一致的。做完AllReduce后，两块GPU继续独立计算，因此实际上有两个dropout）。
+
+关于随机种子设定的一般结论
+
+从例子中，我们可以得出一个结论：一般在TP/PP组内，设定不同的随机种子。而在DP组内，设定相同的随机种子。
+这只是一个一般结论，我们可以根据实际情况去调整。最后，回到模型切割上，
+方案1（先做整体初始化再切割）在代码里被称为“CPU上的初始化”（_initialize_affine_weight_cpu），
+方案2（直接对局部初始化）被称为“在GPU上的初始化”(_initialize_affine_weight_gpu)。
+我们会在切割部分的代码里经常看见它们。
+
+
+三、模型并行框架
+现在，我们可以来看具体的代码了
+
+3.1 模型并行入口函数
+模型并行部分的代码入口依然在megatron/training.py的pretrain 函数下，代码如下：
+
+    def pretrain(
+    。。。。
+
+由代码可知，setup_model_and_optimizer是整个模型并行的入口函数，
+如下图，它主要由”定义模型架构并切割模型“，“设置optimizer”和“设置学习率”三部分组成。我们关注的重点在第一部分上(get_model)。
+12.webp
+
+3.2 定义并搬运模型
+get_model 的内容可简化成下图：  13.webp
+get_model 函数主要做了两件事：
+
+    在CPU上定义模型。pytorch默认在CPU上定义模型(nn.Module)。model_provider 是一个函数，调用它即可返回CPU版的模型，也就是一个CodeGeeX类，这个将是下文要介绍的重点。
+    把模型从CPU搬运至GPU上。这里有两种方法可供选择：
+        方案一：借助deepspeed进行管理。在源码解读1中我们提过，秉持着万物皆可wrap的原则，按照deepspeed官网教程，
+        只需要在Megatron的某些文件中插入相应代码，就可以让deepspeed来管理模型的分布式、DP组间的显存优化等，这里同理。
+
+        方案二：手动搬运管理。这里需要我们以下事情：
+
+            显式搬运。即手动将模型搬运到当前进程所对应的GPU上
+
+            权重精度设定。由ZeRO的思想可知，在模型训练中，把权重精度从fp32降至fp16，是一种节省显存的好办法。
+            如果确定使用这种优化办法，将模型搬运到GPU上后，我们需要修改精度。
+
+            初始化DP组。这里指的是定义DP组间forward、backward和梯度计算与通讯等方法。
+            在Megatron中，TP和PP组的这些方法是人为定义的（在定义CPU模型时已设置好，我们将在下文讲CodeGeeX细节时看到），
+            而DP组则是可以用现成的（torch的DistributedDataParallel）。
+            在具体使用时，我们可以：
+            （1）直接调用DistributedDataParallel。
+            或（2）在DistributedDataParallel这个类的基础上做一些改进，例如增加对碎片化内存的管理，对计算梯度时的精度控制等。
+
+
+get_model 函数的核心代码如下（一切尽在注释中）：
+
+    def get_model(model_provider_func):
+    ....
+
+3.3 分布式模型：CodeGeeX
+现在，我们来看最核心的分布式模型：CodeGeeX类。
+前文说过，1个脚本处理的是1个进程上发生的事情，而1个进程对应的是模型的一部分。单进程的架构如下：
+14.webp
+
+图中每个方框都表示源码里定义的一个nn.Module 类（除了最上的方框外）具体定义为：
+
+    CodeGeeX : 定义一块GPU上的模型。它由TransformerLanguageModel 和_VocabParallelCrossEntropy这两个核心类组成。
+
+    TransformerLanguageModel：定义每块GPU上输入层embedding和中间block层的结构
+
+    Embedding: 定义每块GPU上输入层embedding结构及相关计算，输出结果已AllReduce（TP组间）
+
+    ParallelTransformer：定义每块GPU上所有中间blocks的结构及相关计算，输出结果已AllReduce（TP组间）
+
+    ParallelTransformerLayer: 定义每块GPU上单个block的结构及相关计算，输出结果已AllReduce（TP组间）
+
+    ParallelSelfAttention : 定义每块GPU上单个block中，attention的结构及相关计算，输出结果已AllReduce（TP组间）
+
+    ParallelMLP : 定义每块GPU上单个block中，mlp层的结构及相关计算，输出结果已AllReduce（TP组间）。
+
+    _VocabParallelCrossEntropy: torch.autograd.Function，定义每块GPU上，输出层embedding、softmax和loss等结构及相关计算。
+
+
+为什么需要对输出做AllReduce？回顾Megtron理论部分的讲解，在纵向切割模型时，Megatron是在输入X完整的情况下，设计模型切割的方式的。
+因此，对于模型的每一层输出，我们都要在TP组间做AllReduce，来保证下一层拿到的输入也是完整的。
+类名字中的"Parallel"，也是指在TP组中做并行，如下图所示：  15.webp
+
+
+到这一步，我们终于把模型切割部分的整体流程讲完了。虽然我们是以CodeGeeX为例，但这个流程图可以看作是通用的。
+不同模型间只有模型具体结构、DP/TP/PP组设置这些方面的差别，整个并行框架是通用的。
+下面，我们来探究图中所绘的各个类的细节。
+
+四、MegatronModule
+上面所绘制的几类，并不是直接继承自nn.Module ，而是皆继承于自定义的class MegatronModule(torch.nn.Module)。
+我们说过，gpt类模型，输入和输出层共用一个word embedding。
+因此，这个类的主要作用，就是令PP组的第一个进程和最后一个进程满足这个条件
+（不过我不懂为什么要把这个限制放在一个大母类中去做，设计上感觉有点奇怪）。
+MegatronModule类的整体架构如下：
+16.webp
+
+特别说明，initialize_word_embedding 并不是某一具体的初始化WE方法，它只是起到如图所说的强制作用。
+MegatronModule的代码如下（一切尽在注释中）：
+
+    class MegatronModule(torch.nn.Module):
+    ,,,
+
+五、Embedding
+Emebdding类定义了word/position/segment embedding，并定义输入X过embedding层的计算方法。
+关键属性和方法如下图：
+17.webp
+
+    self.word_embeddings：来自自定义的VocabParallelEmbedding （下面会详述） 。
+    含“Parallel”则意味着参数在TP组间做了切割。因此self.word_embeddings 是切割好的WE。
+    每个进程上维护根据自己进程序号所取下的那块WE（例如下图中的WE1，WE2，图片来自Megatron原理篇）：
+    18.webp
+
+    self.position_embeddings 和self.tokentype_embeddings 这两者都和输入X相关，而输入X是不做切割的，因此这两者也无需切割。
+
+    state_dict_for_save_checkpoint 和load_state_dict 。
+    在源码注解里，这两个函数分别给出了"easy load" 和"customize load"的注释，这个注释不是很贴切。
+    实际上，前者用于在模型训练过程中及时读取当前参数，及时保存（做checkpoint）；
+    后者则一般用于模型的重载，例如训到一半挂掉了，我们就重新初始化一个新模型，重载上个checkpoint保存下的权重。
+
+Embedding层代码如下（一切尽在注释中）：
+
+    class Embedding(MegatronModule):
+        """Language model embeddings.
+
+六、VocabParallelEmbedding
+该类用于定义分布式的word embedding，整体架构如下，同样只列举了核心属性和方法：
+19.webp
+
+具体代码如下，可以特别关注初始化和forward部分，同时建议大家阅读理论篇中关于这一过程的详细讲解（一切尽在注释中）：
+
+    class VocabParallelEmbedding(torch.nn.Module):
+    ....
+
+七、ParallelSelfAttention：分布式block的一般套路
+【阅读提示】：阅读本节时可：
+
+    对照第一部分CodeGeeX框架图
+
+    对照Megatron理论篇对矩阵切分的讲解
+
+首先来看切割Attention的示意图，由图可知，对QKV矩阵，采用“列切割”，对线性矩阵B，采用“行切割”。
+这样设计的好处是，在经过QKV的计算后，各进程在不用通讯的前提下，继续做线性计算，直到最后一步才AllReduce，起到降低通讯成本的作用：
+20.webp
+我们先单独来看“列切割”与“行切割”的实现代码。Megatron将它们定义成了两个nn.Module类。
+
+7.1 列切割：ColumnParallelLinear
+列切割示意图如下： 21.webp
+
+    f和g是两个共轭算子，可理解为两个torch.autograd.Function类。
+    在这个类下，我们可以根据需要重写forward和backward方法。
+
+    f : forward中，直接copy输入；backward中，对梯度做AllReduce。
+    在代码里定义为class _CopyToModelParallelRegion(torch.autograd.Function)
+
+    g: forward中，all-gather输出；backward中，对梯度做split
+    （每张卡经过all-gather已有完整的Y了，因此以Y为起点计算梯度后，沿着列做split就可得到Y1和Y2的梯度）。
+    在代码里定义为class _GatherFromModelParallelRegion(torch.autograd.Function)
+
+代码如下：
+
+    class ColumnParallelLinear(torch.nn.Module):
+        """Linear layer with column parallelism.
+
+7.2 行切割：RowParallelLinear
+22.webp
+
+    f: forward中，按列split输入；backward中，all-gather梯度
+
+    g: forward中，AllReduce输出；backward中，直接输出梯度，无需做任何通讯
+    （因为经过g的foward，每块GPU上已拥有了Yi和Y，则根据图中g的backward公式可知，每块GPU可独立计算梯度）
+
+代码如下：
+
+    class RowParallelLinear(torch.nn.Module):
+        """Linear layer with row parallelism.
+
+
+7.3 ParallelSelfAttention
+该类的构造如下图：
+23.webp
+
+这张图中透露的核心含义是，每个进程上维护的都是按列切割完的QKV矩阵，进程间独立计算，QKV矩阵的输出结果一般不做AllReduce。
+同时，每个进程上维护的是按行切割完的dense（线型层）矩阵，Attention输出过线性层后的结果，做AllReduce。
+另外，在设置attention_dropout时，同样调用了get_cuda_rng_tracker 方法，令TP组内的进程拥有不同的随机种子。
+最后，你可能想问，dense后的dropout去哪里了？
+代码里把它定义到了ParallelTransformerLayer 下（等于attention + mlp）。
+
+相信有了上面的说明，看这块代码就不难了。篇幅限制，这里不展示代码了。
+大家可以对照着CodeGeeX架构图，来看这里multi-head attention的计算方式。
+ParallelMLP，ParallelTransformerLayer和ParallelTransformer都采用的是一样的套路，也略过不言。
+
+八、CrossEntropy
+现在，终于可以来看模型的最后一层：交叉熵的平行计算。核心类为_VocabParallelCrossEntropy。
+我们在原理篇中讲过交叉熵的并行计算，其优化核心是将通讯量从b*s*v降至b*s。
+但是Megatron代码中定义的交叉熵计算方式，稍微复杂一些，也和我们一般理解的交叉熵有些许差异。
+所以我们先用图解，来看下代码定义的交叉熵计算流程：
+【注】：
+    对X和Y_i来说，(b, s, h)维度下应该画成一个立方体，为了表达简练，这里将b拍平了。
+
+    对其余维度中含b的矩阵，b正常表示，即row=b
+24.webp
+
+8.1 计算logit
+首先，在使用_VocabParallelCrossEntropy 计算交叉熵前，我们需要计算logit。
+这时我们调用parallel_lm_logits 函数，将模型最后一层的输出X（复习一下，这个X已经在TP组内AllReduce了），
+乘上当前进程上维护的输入层WE的转置（复习一下，输入层和输出层共用一套embedding），
+得到当前进程的logit Y_i，同时我们选择不对输出logit做AllReduce。
+
+你可能会有一个疑惑：在Transformer中，输出层会额外训练一个线性矩阵，来计算logit；
+为什么在gpt中，可以用输入层WE的转置来代替这个线性矩阵？
+
+这个问题的答案，对理解Megatron交叉熵计算也至关重要。
+我们可将X*WE^T结果理解成“X与WE间的相似度”，例如对Y1来说，它的第一行中的每个logit，表示第一个token与词表里每个词的相似度。
+
+注意到每个进程上只维护部分WE。例如，假设词表共有10个单词，WE1维护前5个单词，WE2维护后5个单词。
+因此再严格来说：对Y1，它的第一行中的每个logit，表示第一个token与词表中前5个词的相似度；
+对Y2，它的第一行中的每个logit，表示第一个token与词表中后5个词的相似度。我们要记住这个含义。
+
+8.2 计算交叉熵
+知道了logit的含义，我们来看交叉熵计算。
+首先做了一系列求max的计算，得到基于全局的max(logit)，再将orig_logit - max(logit)，得到处理后的结果。
+这步理解起来不难，主要目的是为了防止计算溢出。
+接下来，就是基于logit算loss了。
+
+    每个进程上都有一份(b, s)维度的真值，它表示每个token的真值是哪个词（词用id表示）。
+    我们基于这份真值，在Y_i上找出真值位置的logit。
+    例如：seq_length = 3，即我们需要对3个token去做预测，
+    假设前两个token的真值在第1个进程所维护的WE1中，最后一个token的真值在第2个进程所维护的WE2中。
+    那么我们去Y1的前两行里，取出真值位置的logit，这个logit表示“token与真值的相似度”，去Y2的最后一行里做同样操作。
+
+    这样，我们就能得到L1和L2，和真值位置不对应的地方，统一填充0。
+    随后对L1和L2做AllReduce，得到L。L中的每行表示“token与真值间的相似度"
+
+    现在，我们回来对Y1和Y2的每一行求sum(e^logit)，得到e1和e2。将e1和e2做AllReduce，得到e。
+    e中的每行表示“token和词表中所有词相似度的总和”
+
+    我们希望（token和词表中所有词相似度的总和-token与真值间的相似度) /token和词表中所有词相似度的总和这个值最小，
+    这个差值就是最终的loss。
+
+8.3 代码
+理清了这点，现在可以来看代码了（一切尽在注释中），建议对这块还有疑问的朋友，可以写个test脚本把中间结果打印出来，方便理解：
+
+class _VocabParallelCrossEntropy(torch.autograd.Function):
+    """
+
+九、总结
+啊这总结怎么写呢，呕心沥血终于写完了。希望能给到大家帮助！
+
+
+
+十、参考
+1、codegeex github: https://github.com/THUDM/CodeGeeX/tree/7365d9df242d87a5583d3f203e4b6c547dc6240e
+
+2、NVIDIA Megatron github: https://github.com/NVIDIA/Megatron-LM/tree/2c493fb3fd37e5ecac068607b408ed5724d80fcc
+
+3、torch distributed tutorial: https://pytorch.org/docs/stable/distributed.html
+
+4、init_process_group: https://www.cnblogs.com/rossixyz/p/15553670.html
+
+5、DeepSpeed Megatron tutorial: https://www.deepspeed.ai/tutorials/megatron/
+
+6、codegeex paper: https://arxiv.org/abs/2303.17568
+
+编辑于 2023-06-29 19:41・IP 属地北京
+
+ZOMI酱
+我关注的人
+太赞了
+
+07-21 · IP 属地江苏
+​回复
+​2
+无言
+无言
+一直在寻找llm训练的技术博客，太赞了[赞]
+07-04 · IP 属地广东
+​回复
+​1
+XiaJun
+XiaJun
+催更[爱]
+06-29 · IP 属地广东
+​回复
+​2
+小白宇宙最棒
+小白宇宙最棒
+感动哭了，连源码解读都写得这么清楚，谢谢大佬帮助特别大
+06-08 · IP 属地北京
+​回复
+​2
+猛猿
+猛猿
+作者
+​
+谢谢肯定！能带来帮助我很开心
+06-08 · IP 属地北京
+​回复
+​2
+ultrazhl
+ultrazhl
+难得的好文章[赞][赞][赞]
+
+08-02 · IP 属地英国
+​回复
+​1
+圣颖
+圣颖
+催更催更，还有两篇[爱]
+
+07-11 · IP 属地北京
+​回复
+​1
+柱子柱子
+柱子柱子
+看论文的时候，output embedding和交叉熵损失融合一句话带过，让人困惑，查了很多资料，MLP和Multihead都讲得比较清楚，但是交叉熵损失融合这个几乎没有讲的，您这里是完完全全讲明白了，感谢
+
+06-29 · IP 属地浙江
+​回复
+​1
+ayyha
+ayyha
+催更催更[酷]
+
+06-28 · IP 属地湖南
+​回复
+​1
+猛猿
+猛猿
+作者
+​
+[调皮]收到
+06-28 · IP 属地北京
+​回复
+​1
+孙不花
+孙不花
+很棒！催更下期哈哈哈哈
+
+06-14 · IP 属地上海
+​回复
+​1
+XiaoYee
+XiaoYee
+写得太好了，感谢大佬
+
+06-08 · IP 属地新加坡
+​回复
+​1
+猛猿
+猛猿
+作者
+​
+[害羞][机智]
+06-08 · IP 属地北京
+​回复
+​1
+nobody
+nobody
+# 3、构造train/val/test数据集（下一篇将讲述）
+...
+# 4、训练（下下一篇将讲述）
+
+
+
+===补齐了吗[大笑]
+
+8 小时前 · IP 属地新加坡
+​回复
+​喜欢
+nobody
+nobody
+赞[酷]
+
+9 小时前 · IP 属地新加坡
+​回复
+​喜欢
+不理不理
+不理不理
+请问大佬，“WE1和WE2间需要采用不同的随机种子。因为若采用相同的随机种子，则WE1和WE2的结果完全一样，这不等价于先随机初始化WE，再将它进行切割。”这句话里，如果采用了相同的随机种子，按理说WE1和WE2分属矩阵的不同位置，那么WE1和WE2不是不一样吗
+
+09-15 · IP 属地上海
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+我们的目标是要让分布式和单机的结果尽量一致。单机中，初始化WE，那么WE1和WE2应该是不一样的。所以分布式中也要还原这点，如果分布式里采用相同的种子，那么WE1和WE2就是一样的，和单机不符合，所以要用不同的种子
+09-16 · IP 属地北京
+​回复
+​1
+猛猿
+猛猿
+作者
+​
+不理不理
+可以再细看一下get_cuda_rng_traker()的实现细节，另外再找到分布式初始化这块代码里，初始化时随机种子设计的方式来看。we1和we2是采用不同随机种子的。再推荐paddle的一篇文章paddlepaddle.org.cn/sup 这里也对随机种子做了说明
+09-16 · IP 属地北京
+​回复
+​1
+不理不理
+不理不理
+我回去又看了代码，WE1和WE2间采用的相同的随机数种子，因为这个dropout没有用get_cuda_rng_tracker()
+
+09-15 · IP 属地上海
+​回复
+​喜欢
+不理不理
+不理不理
+猛猿
+喔，我不小心说错了。我看Embedding类中VocabParallelEmbedding后面还跟了一个Dropout，这个Dropout运行时没加get_cuda_rng_tracker()。而且VocabParallelEmbedding运行结果是All reduce的，所以这个Dropout应该是TP组内同seed对吧？
+
+09-16 · IP 属地上海
+​回复
+​喜欢
+大荒令主
+大荒令主
+感谢，文章写的非常清晰，把一些知识上的盲区都扫清了。有一个问题是，实际应用到生产环境中，有同时实现dp/pp/tp的工具吗？貌似deepspeed只有 dp+pp
+
+08-22 · IP 属地北京
+​回复
+​喜欢
+大树
+大树
+有megatron-deepspeed可以看看，集成了tp,pp和zero
+
+08-29 · IP 属地江苏
+​回复
+​1
+明月松间照
+明月松间照
+请问virtual pipeline 的模型chunk划分是如何实现的呢？一直没找到对应的代码[捂脸]
+
+08-02 · IP 属地浙江
+​回复
+​喜欢
+明月松间照
+明月松间照
+猛猿
+催更，催更[赞][赞][赞]
+
+08-02 · IP 属地浙江
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+[捂脸]这块在这篇文章里提了下，因为要详细写涉及的内容比较多，所以需要单开一篇来写，但是懒癌犯了一直没动笔
+08-02 · IP 属地北京
+​回复
+​喜欢
+伊轲
+伊轲
+牛啊牛啊，看了之后，豁然开朗
+
+07-22 · IP 属地上海
+​回复
+​喜欢
+ZOMI酱
+ZOMI酱
+我关注的人
+停更了吗？
+
+07-21 · IP 属地江苏
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+没有没有，实在是最近太忙，应该下个月会开始继续更的～
+07-21 · IP 属地北京
+​回复
+​1
+ZOMI酱
+ZOMI酱
+我关注的人
+继续加油！
+
+07-21 · IP 属地江苏
+​回复
+​喜欢
+德卢
+德卢
+好文章！有没有对3D并行做内存占用、通信开销的分析呢
+
+07-19 · IP 属地江苏
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+zhuanlan.zhihu.com/p/62 这个链接下有，可以看开头链接下的那几篇文章
+07-19 · IP 属地北京
+​回复
+​喜欢
+德卢
+德卢
+猛猿
+感谢！
+07-20 · IP 属地江苏
+​回复
+​喜欢
+圣颖
+圣颖
+方便说一下，这个源码对应git 上哪一个版本吗～
+
+好像最新的代码和博客里的讲解有些出入
+
+07-13 · IP 属地北京
+​回复
+​喜欢
+圣颖
+圣颖
+注释有个小错误[爱]
+
+# 1块进程1个GPU。device为GPU编号。例如图例中的进程9，其所在机器上有8块卡。因此进程9使用的gpu编号为8%9=1 （9%8=1）
+
+07-11 · IP 属地北京
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+👌明儿到了电脑前check下～感谢！
+07-11 · IP 属地北京
+​回复
+​喜欢
+圣颖
+圣颖
+有个疑问：
+
+# 将当前进程所维护的模型，从CPU搬运到GPU上（GPU即为在初始化时为当前进程分配的那块GPU）
+print(f" > moving model to GPU ...", flush=True)
+for model_module in model:
+model_module.cuda(torch.cuda.current_device())
+print(f" > moving to GPU done", flush=True)
+
+这里不是把完整的未切分的模型拷贝到了每张卡上吗
+
+07-11 · IP 属地北京
+​回复
+​喜欢
+圣颖
+圣颖
+猛猿
+哦哦，也就是模型开始定义的时候，就是定义的切分后的“分布式的“模型，每个进程上的模型都不一样。而不是一开始定义完整的模型，再去切分。[大笑]
+
+感谢感谢，终于弄明白一点了，哈哈。开心的睡觉去了～[大笑]
+
+07-11 · IP 属地北京
+​回复
+​1
+ldwang
+ldwang
+猛猿
+torch.nn.Embedding 像这种成员应该是每个卡一份，然后DDP做权重同步吗
+
+09-16 · IP 属地北京
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+hh不是，我在刚读源码的时候和你有一样的困惑，你可以往后看，看model的具体定义和forward计算方法，会发现每个进程上都是不一样的，这个model是分布式的。
+07-11 · IP 属地北京
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+或者直接看3.3部分的图，这里的model相当于图中的一个红色虚线框，不同进程上维护不同的虚线框
+07-11 · IP 属地北京
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+圣颖
+对滴[赞同]
+07-12 · IP 属地北京
+​回复
+​喜欢
+万物小白
+万物小白
+您好，我有一个问题想请教一下，就像您模型划分框架里的那样，模型切分到了不同的node上面，那程序是怎样确定模型的某一部分是放到那个时候节点上的呢？另外还有一个疑问，就是手动搬运设置的时候，各个进程执行的都是同一份程序，那遍历模型的各个子结构放到该进程对应GPU上面，那不是就整个模型都放在这个对应的GPU上了？
+
+07-09 · IP 属地北京
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+可以先看一下源码解读的上一篇：分布式环境初始化。这一篇里会将怎么给模型设置分布式并行组，这样操作完之后，对于每个进程，我们都可以读取到它对应的序号id，我们用序号id来确定进程应该维护的是模型的哪一部分。然后，在初始化权重和搬运的时候，我们就可以只搬运这一部分。总结来说就是“id->所维护的模型”这样一个关系。
+
+07-11 · IP 属地北京
+​回复
+​喜欢
+不理不理
+不理不理
+请问大佬是自己构建了一个简单的数据集来debug pretrain的吗[爱]
+
+07-03 · IP 属地上海
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+不理不理
+是的～
+07-04 · IP 属地北京
+​回复
+​1
+猛猿
+猛猿
+作者
+​
+是的～甚至如果不涉及到分词的话，随便构造一些矩阵也行，主要目的是看下各模块输入输出的结构，类似的debug方法可以参考Megatron git仓库里的test模块，提供了一些做结构测试的方法～这种测试方法主要是测功能和学代码的～
+07-03 · IP 属地北京
+​回复
+​1
+不理不理
+不理不理
+猛猿
+请问大佬，您说的test模块是不是这个，github.com/NVIDIA/Megat
+
+07-03 · IP 属地上海
+​回复
+​喜欢
+不理不理
+不理不理
+猛猿
+大佬可以分享一下您做测试的data-path文件吗[可怜][可怜]，不知道预训练的数据格式是啥样的
+
+07-04 · IP 属地上海
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+zhuanlan.zhihu.com/p/38 可以看下这篇文章里提供的样例数据，以及预训练数据的处理方法
+07-04 · IP 属地北京
+​回复
+​1
+ZOMI酱
+ZOMI酱
+我关注的人
+一看目录就知道是好文章！牛逼！收藏
+06-19 · IP 属地北京
+​回复
+​喜欢
+猛猿
+猛猿
+作者
+​
+[机智][机智][抱抱]感谢支持！
+06-19 · IP 属地北京
+​回复
+

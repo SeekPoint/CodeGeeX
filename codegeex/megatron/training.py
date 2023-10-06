@@ -76,6 +76,11 @@ def print_datetime(string):
 # 3.2 代码整体解读
 # 明确了初始化代码要做的事情，现在可以来看代码实现了。
 # 回到pretrain函数，它的第一行就通过initialize_megatron执行了分布式初始化：
+
+# 三、模型并行框架
+# 现在，我们可以来看具体的代码了
+# 3.1 模型并行入口函数
+# 模型并行部分的代码入口依然在megatron/training.py的pretrain 函数下，代码如下：
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -107,7 +112,7 @@ def pretrain(
         args_defaults: a dictionary from argument-name to argument-value. It
             to set already parse arguments.
     """
-
+    # 1.初始化分布式环境(源码解读1内容)
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
         extra_args_provider=extra_args_provider, args_defaults=args_defaults
@@ -141,6 +146,8 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers("model-and-optimizer-setup").start()
+
+    # 2、模型并行：定义模型架构，并切割模型（本文重点）
     model, optimizer, lr_scheduler = setup_model_and_optimizer(model_provider)
     timers("model-and-optimizer-setup").stop()
     print_datetime("after model, optimizer, and learning rate " "scheduler are built")
@@ -162,6 +169,7 @@ def pretrain(
             data_iterators[2] for data_iterators in all_data_iterators
         ]
     else:
+        # 3、构造train/val/test数据集（下一篇将讲述）
         (
             train_data_iterator,
             valid_data_iterator,
@@ -175,6 +183,7 @@ def pretrain(
     timers.log(["model-and-optimizer-setup", "train/valid/test-data-iterators-setup"])
     print_rank_0("training ...")
 
+    # 4、训练（下下一篇将讲述）
     iteration = 0
     if args.do_train and args.train_iters > 0:
         iteration = train(
@@ -248,15 +257,24 @@ def update_train_iters(args):
 
     print_rank_0("setting training iterations to {}".format(args.train_iters))
 
+'''
+特别说明的是，前文提过模型的首尾两层和中间层的架构可能不一样，
+因此我们通过pre_process 和post_process来做区分。
+（当然你也能选择用进程序id，只是首尾两层经常被Q到，所以这里单独明确了下）。
 
+对CodeGeeX来说，由它预训练配置可知，它的PP并行度为1，也就是1块GPU上涵盖了模型的第一层至最后一层，
+所以pre_process和post_process实际上没有用到。
+感兴趣的朋友可以阅读NVIDIA Megatron源码下关于bert、gpt2的预训练代码，
+具体了解pre_process和post_process在定义模型时起的作用。
+'''
 def get_model(model_provider_func):
     """Build the model."""
     args = get_args()
 
-    # Build model.
-    if (
-        mpu.get_pipeline_model_parallel_world_size() > 1
-        and args.virtual_pipeline_model_parallel_size is not None
+    # 1、定义并构建CPU版模型
+    if (  # 1.1、当分布式进行框架采用virtual pipeline (是NVDIA后续提出的对Megatron的优化方法，可先忽略不看)
+            mpu.get_pipeline_model_parallel_world_size() > 1
+            and args.virtual_pipeline_model_parallel_size is not None
     ):
         model = []
         for i in range(args.virtual_pipeline_model_parallel_size):
@@ -268,9 +286,12 @@ def get_model(model_provider_func):
                 pre_process=pre_process, post_process=post_process
             )
             model.append(this_model)
-    else:
+    else:  # 1.2 其余情况
+        # 判断当前进程是否是PP组的第一个进程（例如第一部分图例中PP组的g0）
         pre_process = mpu.is_pipeline_first_stage()
+        # 判断当前进程是否是PP组的最后一个进程（例如第一部分图例中PP组的g12）
         post_process = mpu.is_pipeline_last_stage()
+        # 构建CPU版CodeGeeX模型
         model = model_provider_func(pre_process=pre_process, post_process=post_process)
 
     if not isinstance(model, list):
@@ -306,21 +327,25 @@ def get_model(model_provider_func):
             flush=True,
         )
 
+    # 2、将模型从CPU搬运到GPU上
+    # 2.1 如果采用Megatron-DeepSpeed的方式，则直接返回模型，后面的搬运，数据并行等工作将由deepspeed来完成
+    # ref：https://www.deepspeed.ai/tutorials/megatron/
     if args.deepspeed:
         return model
 
-    # GPU allocation.
+    # 将当前进程所维护的模型，从CPU搬运到GPU上（GPU即为在初始化时为当前进程分配的那块GPU）
     print(f" > moving model to GPU ...", flush=True)
     for model_module in model:
         model_module.cuda(torch.cuda.current_device())
     print(f" > moving to GPU done", flush=True)
 
-    # Fp16 conversion.
+    # fp16转换（pytorch默认模型参数精度为fp32，依需决定计算过程中是否要转成fp16，节省显存）
     if args.fp16 or args.bf16:
         print(f" > converting model to fp16 ...", flush=True)
         model = [Float16Module(model_module, args) for model_module in model]
         print(f" > converting to fp16 done", flush=True)
 
+    # 采用pytorch定义的DistributedDataParallel管理数据并行
     if args.DDP_impl == "torch":
         i = torch.cuda.current_device()
         model = [
@@ -334,7 +359,9 @@ def get_model(model_provider_func):
         ]
         return model
 
-    if args.DDP_impl == "local":
+    # 采用自定义的DistributedDataParallel管理数据并行
+    # 即在pytorch的DistributedDataParallel的基础上，自己再定义内存管理、梯度精度等计算方式，更有效利用显存
+    if args.DDP_impl == "local":  # 自定义的数据并行类在megatron/model/distributed.py下
         print(f" > creating DDP model ...", flush=True)
         model = [
             LocalDDP(
@@ -350,7 +377,6 @@ def get_model(model_provider_func):
     raise NotImplementedError(
         "Unknown DDP implementation specified: {}. " "Exiting.".format(args.DDP_impl)
     )
-
 
 def get_learning_rate_scheduler(optimizer):
     """Build the learning rate scheduler."""
